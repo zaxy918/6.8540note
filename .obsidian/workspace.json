@@ -209,8 +209,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300,
-    "collapsed": true
+    "width": 300
   },
   "left-ribbon": {
     "hiddenItems": {
@@ -229,9 +228,9 @@
   "active": "b71e00201ea9095b",
   "lastOpenFiles": [
     "Untitled.base",
+    "Lab1-MapReduce.md",
     "pictures",
     "pictures/mapreduce-workflow.png",
-    "Lab1-MapReduce.md",
     "rust_temp.md",
     "temp.md",
     "Spring/SpringCloud/Sentinel.md",
@@ -272,7 +271,6 @@
     "Gateway.pdf",
     "Spring/SpringCloud",
     "Docker",
-    "MySql",
     "Untitled.canvas"
   ]
 }
