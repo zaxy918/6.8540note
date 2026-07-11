@@ -119,8 +119,7 @@ The basic structure of Mapreduce is defined now, so I continue my work in the Ma
 func Worker(sockname string, mapf func(string, string) []KeyValue,reducef func(string, []string) string) {
 ...
 	case MapTask:
-		//*debug
-		// fmt.Printf("Worker %v start map task%v\n", reply.WorkerId, reply.TaskId)
+		slog.Debug("Start map task", "worker_id", reply.WorkerId, "task_id", reply.TaskId)
 		// Iterate all files
 		kvs := []KeyValue{}
 		for _, filename := range files {
@@ -135,26 +134,20 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,reducef func(s
 		// Generate temporary file for reduce worker
 		interFileNames := writeIntermediate(kvs, reply.TaskId)
 		args = WorkerArgs{Status: MapDone, InterFileNames: interFileNames, WorkerId: reply.WorkerId}
-		//*debug
-		// fmt.Printf("Map task %v done\n", reply.TaskId)
+		slog.Debug("Map task done", "worker_id", reply.WorkerId, "task_id", reply.TaskId)
 ...
 }
 ```
 The work is very simple, read from the files assigned by coordinator (in this lab only 1 file per worker. However, I intense to make my design work in more common case). Then send the file content to mapf(), collecting the kvs, and write the kvs to intermediate files. After finish work, update the PRC args.
 ```go
 func writeIntermediate(kvs []KeyValue, taskId int) []string {
-	// Write all kvs to file to avoid open the file repeatedly
-	//*debug
-	// fmt.Println("Get in writeIntermediate")
+	// Store all kvs in a map to avoid open the file repeatedly
 	fileToContent := make(map[string]([]KeyValue))
 	for _, kv := range kvs {
 		reducerId := ihash(kv.Key) % nReduce
 		filename := fmt.Sprintf("mr-%v-%v", taskId, reducerId)
 		fileToContent[filename] = append(fileToContent[filename], kv)
 	}
-	//*debug
-	// time.Sleep(time.Second)
-	// fmt.Println("Finish fileToContent map")
 	interFileNames := []string{}
 	for filename, kvs := range fileToContent {
 		interFileNames = append(interFileNames, filename)
@@ -173,8 +166,6 @@ func writeIntermediate(kvs []KeyValue, taskId int) []string {
 			log.Fatal(err)
 		}
 	}
-	//*debug
-	// fmt.Println("Finish create and write to temp file")
 	return interFileNames
 }
 ```
@@ -206,37 +197,35 @@ Not all the fields in Coordinator is used now. I mark the part of which they are
 ```go
 ...
 case Wait:
-	if !c.allMapDone {
-		if len(c.inputFile) > 0 {
-			// Have files to assign
-			//*debug
-			// fmt.Printf("Assign a map task with taskId=%v\n", c.taskId)
-			expireTime := time.Now().Add(EXPIRE_TIME)
-			worker = WorkerEntry{MapTask, worker.workerId, []string{c.inputFile[0]}, expireTime, c.taskId}
-			c.replyAndSetWorkerList(&worker, reply)
-			c.inputFile = c.inputFile[1:]
-			c.mapperCnt++
-			c.taskId++
-			//*debug
-			// fmt.Println(reply)
-		} else {
-			// No files to assign
-			//*debug
-			// fmt.Println("No file to map, just wait")
-			expireTime := time.Now().Add(EXPIRE_TIME)
-			worker.deadLine = expireTime
-			c.replyAndSetWorkerList(&worker, reply)
-		}
+	switch {
+	// Map phase
+	case !c.allMapDone && len(c.inputFile) > 0:
+		slog.Debug("Assign map task", "task_id", c.taskId, "worker_id", worker.workerId)
+		// Take the input file out
+		fiilename := c.inputFile[0]
+		c.inputFile = c.inputFile[1:]
+		// Assign to worker
+		worker = WorkerEntry{MapTask, worker.workerId, []string{fiilename}, getExpireTime(), c.taskId}
+		c.replyAndSetWorkerList(&worker, reply)
+		// Some state update
+		c.mapperCnt++
+		c.taskId++
+	// No task to assign
+	default:
+	slog.Debug("No work, just wait")
+	// Wait for all work done, some task fail, or all map done
+	c.cond.Wait()
+	// Reply to worker to start a new rpc
+	worker.deadLine = getExpireTime()
+	c.replyAndSetWorkerList(&worker, reply)
 ...
 ```
 The expireTime and WorkerEntry will be discussed in the fault tolerance part. What the initial design do is just to assign a taskId and inputFile to worker. Then delete the corresponding inputFiles and increase the mapperCnt and taskId. If there no file to map, just wait. What to do next is deal with the finished job of mapper.
 ```go
 ...
-case Mapdone:
-	//*debug
-	// fmt.Println("Maptask done, store inter file location")
-	c.mapperCnt--
-	c.interFileCnt += len(args.InterFileNames)
+case MapDone:
+	slog.Debug("Map task done, store intermediate file locations", "worker_id", worker.workerId)
+	// Store the intermediate files
 	for _, filename := range args.InterFileNames {
 		parts := strings.Split(filename, "-")
 		reducerId, err := strconv.Atoi(parts[len(parts)-1])
@@ -245,18 +234,18 @@ case Mapdone:
 		}
 		c.intermediateFiles[reducerId] = append(c.intermediateFiles[reducerId], filename)
 	}
-	//*debug
-	// fmt.Println("Inter file stored")
+	slog.Debug("Stored intermediate file locations", "worker_id", worker.workerId)
+	// Some state update
+	c.mapperCnt--
+	c.interFileCnt += len(args.InterFileNames)
 	// All mappers done
-	// This is the last mapper and all files are handled
-	if c.mapperCnt == 0 && len(c.inputFile) == 0 && len(c.failTaskFiles) == 0 {
-		//*debug
-		// fmt.Println("All map work done")
+	if c.mapperCnt == 0 && len(c.inputFile) == 0 && len(c.failTask) == 0 {
+		slog.Debug("All map work done")
 		c.allMapDone = true
 		c.taskId = 0
 	}
-	expireTime := time.Now().Add(EXPIRE_TIME)
-	worker = WorkerEntry{Wait, worker.workerId, nil, expireTime, -1}
+	// Reply
+	worker = WorkerEntry{Wait, worker.workerId, nil, getExpireTime(), -1}
 	c.replyAndSetWorkerList(&worker, reply)
 ...
 ```
@@ -266,31 +255,29 @@ First the mapperCnt-- and increase the interFileCnt. Then I collect the filename
 The map part comes to a conclusion. Then I do the reduce part also starting from Worker().
 ```go
 case ReduceTask:
-	//*debug
-	// fmt.Printf("Worker %v start reduce task%v\n", reply.WorkerId, reply.TaskId)
+	slog.Debug("Start reduce task", "worker_id", reply.WorkerId, "task_id", reply.TaskId)
+	// Read files
 	interFileNames := reply.Files
 	reducerId := reply.TaskId
 	kvs := readFromInterFiles(interFileNames)
-	//*debug
-	//fmt.Println(kvs)
+	// Sort it
 	sort.Sort(KVList(kvs))
+	// Construct the args for reducef
 	keyToAllValues := make(map[string][]string)
 	for _, kv := range kvs {
 		keyToAllValues[kv.Key] = append(keyToAllValues[kv.Key], kv.Value)
 	}
-	//*debug
-	// fmt.Println(keyToAllValues)
 	oFile, err := os.Create(fmt.Sprintf("mr-out-%v", reducerId))
 	if err != nil {
 		log.Fatalf("Create file %v fail\n", oFile)
 	}
+	// Do the reducef
 	for k, vs := range keyToAllValues {
 		res := reducef(k, vs)
 		fmt.Fprintf(oFile, "%v %v\n", k, res)
 	}
 	args = WorkerArgs{Status: ReduceDone, WorkerId: reply.WorkerId}
-	//*debug
-	// fmt.Printf("Reduce task %v done\n", reply.TaskId)
+	slog.Debug("Reduce task done", "worker_id", reply.WorkerId, "task_id", reply.TaskId)
 ```
 First I read files and reducerId from reply, and parse kvs from the interFileNames. Then I sort the kvs and combine all the values with the same key and send it to reducef to get the res to write in mr-out-reducerId. The readFromInterFiles and sort implement is as follows.
 ```go
@@ -320,33 +307,30 @@ Very simple use of encoding/json and sort.Sort()
 Then goes back to reducer assign in the mr/coordinator.go. The code is as follows.
 ```go
 case Wait:
-	if !c.allMapDone{
-	...
-	}
-	else if c.interFileCnt > 0 {
-		//*debug
-		// fmt.Printf("Assign a reduce task with taskId=%v\n", c.taskId)
+	case c.interFileCnt > 0 && c.allMapDone:
+		slog.Debug("Assign reduce task", "task_id", c.taskId, "worker_id", worker.workerId)
+		// Take the intermediate files out
 		interFileNames := c.intermediateFiles[c.taskId]
-		expireTime := time.Now().Add(EXPIRE_TIME)
-		worker = WorkerEntry{ReduceTask, worker.workerId, interFileNames, expireTime, c.taskId}
-		c.replyAndSetWorkerList(&worker, reply)
 		c.interFileCnt -= len(c.intermediateFiles[c.taskId])
+		worker = WorkerEntry{ReduceTask, worker.workerId, interFileNames, getExpireTime(), c.taskId}
+		c.replyAndSetWorkerList(&worker, reply)
+		// Some state update
 		c.taskId++
 		c.reducerCnt++
-	}
 ```
 We just simply send the interFileNames to corresponding worker and do some update to the fields in Coordinator. Then comes to the ReduceDone case:
 ```go
 case ReduceDone:
 	c.reducerCnt--
-	if c.reducerCnt == 0 && c.interFileCnt == 0 && len(c.failTaskFiles) == 0 {
+	if c.reducerCnt == 0 && c.interFileCnt == 0 && len(c.failTask) == 0 {
 		c.allReduceDone = true
 	}
-	//*debug
-	// fmt.Println("One reduce task done")
-	expireTime := time.Now().Add(EXPIRE_TIME)
-	worker = WorkerEntry{Wait, worker.workerId, nil, expireTime, -1}
+	slog.Debug("Reduce task done", "worker_id", worker.workerId)
+	// Reply
+	worker = WorkerEntry{Wait, worker.workerId, nil, getExpireTime(), -1}
 	c.replyAndSetWorkerList(&worker, reply)
+default:
+	return errors.New("invalid task status")
 ```
 The logic is really simple, no need to explain.
 
@@ -355,38 +339,31 @@ The logic is really simple, no need to explain.
 After all reduce work done, the worker and coordinator should terminate. The logic in Worker() is simple. We just need to write a `os.Exit(0)` in `case Exit`. The main work is in the mr/coordinator.go.
 ```go
 case Wait:
-	if !c.allMapDone {
-	...
-	} else if c.interFileCnt > 0 {
-	...	
-	} else if c.allReduceDone {
-		//*debug
-		// fmt.Println("Kill worker")
-		c.aliveWorker--
-		worker.status = Exit
-		c.replyAndSetWorkerList(&worker, reply)
+	case c.allReduceDone:
+		slog.Debug("Kill worker")
+		// All worker exit, clean the intermediate files
 		if c.aliveWorker == 0 {
-			//*debug
-			// fmt.Println("All worker killed, clean inter files")
+			slog.Debug("All worker killed, clean inter files")
 			for _, filenames := range c.intermediateFiles {
 				for _, filename := range filenames {
 					os.Remove(fmt.Sprintf("/tmp/%v", filename))
 				}
 			}
-			//*debug
-			// fmt.Println("All inter files cleaned, goodbye!")
-	} else {
-		worker.deadLine = time.Now().Add(EXPIRE_TIME)
-		worker.taskId = -1
+			slog.Debug("All inter files cleaned, goodbye!")
+		}
+		// Tell the worker to exit
+		worker.status = Exit
 		c.replyAndSetWorkerList(&worker, reply)
-	}
+		// State update
+		c.aliveWorker--
 ```
 Before all reduce work done, the worker should wait. When it is the time, we do c.aliveWorker-- and send an Exit to worker. Then clear all the intermediate files. The c.aliveWorker was increased when the worker first call Assign(). The code is as follows. We also do something for the fault tolerance at that time.
 ```go
 func (c *Coordinator) Assign(args *WorkerArgs, reply *WorkerReply) error {
-	c.mu.Lock()
+		c.mu.Lock()
 	defer c.mu.Unlock()
 	worker := WorkerEntry{status: args.Status, workerId: args.WorkerId}
+	// When the worker first do rpc, something should be initialized
 	if args.IsFirstCall {
 		worker.workerId = c.workerId
 		worker.taskId = -1
@@ -394,8 +371,9 @@ func (c *Coordinator) Assign(args *WorkerArgs, reply *WorkerReply) error {
 		c.workerId++
 		c.aliveWorker++
 	}
+	// The worker now is marked dead
 	if c.workerList[worker.workerId].status == Exit {
-		worker = WorkerEntry{Exit, worker.workerId, nil, time.Now().Add(EXPIRE_TIME), -1}
+		worker = WorkerEntry{Exit, worker.workerId, nil, getExpireTime(), -1}
 		c.replyAndSetWorkerList(&worker, reply)
 		return nil
 	}
@@ -411,8 +389,7 @@ func (c *Coordinator) Done() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.aliveWorker == 0 && c.allReduceDone {
-		//*debug
-		// fmt.Println("Coordinator done")
+		slog.Debug("Coordinator done")
 		return true
 	}
 	return false
@@ -423,10 +400,8 @@ func (c *Coordinator) Done() bool {
 
 My design is to define two kinds of ids: workerId and taskId, a failTaskList, and the structure WorkerEntry and Task.
 ```go
-const (
-	MAX_WORKER  = 10
-	EXPIRE_TIME = 10 * time.Second
-)
+// The task expire after 10 seconds from the time it was asigned
+func getExpireTime() time.Time { return time.Now().Add(time.Second * 10) }
 
 type WorkerEntry struct {
 	status   Status
@@ -444,19 +419,21 @@ type Task struct {
 ```
 When the worker first do RPC, it is assigned a workerId. And we make a new WorkerEntry and add it to c.workerList. When the coordinator wants to assign a map or reduce job to a worker, the taskId is assigned. There is also a function to periodically check if some worker is died. We run the function in MakeCoordinator()
 ```go
+// Try to find if some worker is dead
 func (c *Coordinator) checkWorkerStatus() {
 	for {
 		time.Sleep(time.Second)
 		c.mu.Lock()
 		for _, worker := range c.workerList {
-			//*debug
-			// fmt.Printf("The worker %v\n", worker)
-			if time.Now().After(worker.deadLine) && worker.status != Exit {
-				//*debug
-				// fmt.Printf("Worker%v died with task%v\n", worker.workerId, worker.taskId)
-				c.failTaskFiles = append(c.failTaskFiles, Task{worker.taskId, worker.status, worker.files})
+			slog.Debug("Check worker", "worker", worker)
+			if worker.status != Wait && time.Now().After(worker.deadLine) && worker.status != Exit {
+				slog.Debug("Worker died", "worker_id", worker.workerId, "task_id", worker.taskId)
+				// Add fail task to list
+				c.failTask = append(c.failTask, Task{worker.taskId, worker.status, worker.files})
 				c.workerList[worker.workerId].status = Exit
 				c.aliveWorker--
+				// Tell the waiting worker to have task
+				c.cond.Broadcast()
 			}
 		}
 		c.mu.Unlock()
@@ -472,25 +449,26 @@ func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator 
 		nReduce:           nReduce,
 		intermediateFiles: make(map[int][]string),
 	}
-	//*debug
-	// fmt.Println("create coordinator")
 	c.server(sockname)
 	go c.checkWorkerStatus()
+	slog.Debug("Create coordinator")
 	return &c
 }
+
+
 ```
 Here is how it works: When a worker is died, the coordinator will notice that and make the status in c.workerList be Exit. Then add the files to c.failTaskList. And in `Wait case`, we check if there are some failed task and assign it to the worker.
 ```go
 case Wait:
-	if len(c.failTaskFiles) > 0 {
-		task := c.failTaskFiles[0]
-		//*debug
-		// fmt.Printf("Worker%v continue failed task%v\n", worker.workerId, task.taskId)
-		expireTime := time.Now().Add(EXPIRE_TIME)
-		worker = WorkerEntry{task.status, worker.workerId, task.files, expireTime, task.taskId}
+	// Some files has failed
+	case len(c.failTask) > 0:
+		// Take the task out
+		task := c.failTask[0]
+		c.failTask = c.failTask[1:]
+		// Assign to worker
+		slog.Debug("Continue failed task", "worker_id", worker.workerId, "task_id", task.taskId)
+		worker = WorkerEntry{task.status, worker.workerId, task.files, getExpireTime(), task.taskId}
 		c.replyAndSetWorkerList(&worker, reply)
-		c.failTaskFiles = c.failTaskFiles[1:]
-	}
 ```
 The reason why we separate the taskId and workerId is because we should not generate two task's out put to one file. (e.g. If one reducer deals two tasks without this design, the second result will cover the first result since we generate the file mr-out-\* based on the taskId).
 At last, here is the all-pass picture:
