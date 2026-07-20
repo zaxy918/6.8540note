@@ -29,22 +29,7 @@ The tests cover:
 
 This part does not yet implement command replication, commit and apply, persistence, or snapshots.
 
-### Final Result
 
-My final repeated run reported:
-
-```text
-Passed rounds: 1000
-Failed rounds: 0
-
-Average time by test case:
-  TestInitialElection3A                      4.406s  (1000 runs)
-  TestManyElections3A                        8.462s  (1000 runs)
-  TestReElection3A                           5.909s  (1000 runs)
-Average time sum of all test cases: 18.777s
-```
-
-This is strong evidence for the tested 3A scenarios. It is not proof that the implementation already satisfies every rule needed by the complete Raft protocol.
 
 ---
 
@@ -218,7 +203,7 @@ rf := &Raft{}
 rf.peers = peers
 rf.persister = persister
 rf.me = me
-rf.heartBeatCh = make(chan int)
+rf.heartBeatCh = make(chan int, 1)
 rf.state = Follower
 // initialize from state persisted before a crash
 rf.readPersist(persister.ReadRaftState())
@@ -356,45 +341,37 @@ type RequestVoteReply struct {
 }
 ```
 
-My current eligibility check is:
+The handler:
 
 ```go
-func (rf *Raft) shouldGrantVote(args *RequestVoteArgs) bool {
-	if args.Term <= rf.currentTerm {
-		return false
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm || rf.votedFor != -1 && rf.currentTerm == args.Term {
+		*reply = RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
+		return
 	}
-	if args.LastLogTerm < func() int {
-		if len(rf.log) > 0 {
-			return rf.log[len(rf.log)-1].Term
-		}
-		return 0
-	}() {
-		return false
-	}
-	if args.LastLogIndex < len(rf.log) {
-		return false
-	}
-	return true
-}
-```
-
-The state change in the handler is:
-
-```go
-if rf.shouldGrantVote(args) {
-	rf.votedFor = args.CandidateId
+	upToDate :=
+		args.LastLogTerm > rf.lastLogTerm() ||
+			(args.LastLogTerm == rf.lastLogTerm() &&
+				args.LastLogIndex >= rf.lastLogIndex())
 	rf.currentTerm = args.Term
-	if rf.state != Follower {
-		rf.state = Follower
+	rf.state = Follower
+	rf.votedFor = -1
+	if upToDate {
+		rf.votedFor = args.CandidateId
+		select {
+		case rf.heartBeatCh <- args.CandidateId:
+		default:
+		}
+		*reply = RequestVoteReply{Term: rf.currentTerm, VoteGranted: true}
+	} else {
+		*reply = RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
 	}
-	*reply = RequestVoteReply{Term: rf.currentTerm, VoteGranted: true}
-} else {
-	*reply = RequestVoteReply{Term: rf.currentTerm, VoteGranted: false}
 }
 ```
 
-> [!caution] Lab 3A scope
-> This passed my 3A tests, but later parts should align voting exactly with Raft Figure 2: update the term whenever a higher term is observed, track one vote per term, handle valid duplicate requests, and compare log freshness by last term and then last index.
+First check if the Candidate is stale or the current peer has already voted for some one. Then update current state and vote for the Candidate if it is updated. Should send a heartbeat after granting vote.
 
 ---
 
@@ -463,6 +440,21 @@ reply := AppendEntriesReply{}
 go rf.sendAppendEntries(server, shutDown, &args, &reply)
 ```
 
+> [!note] Future refinement
+> When doing the Lab3B, the heartbeat is also used to send commitment state and entries to Followers to update local logs. So the final design is as follows:
+> ```go
+>args := AppendEntriesArgs{
+>Term:         rf.currentTerm,
+>LeaderId:     rf.me,
+>LeaderCommit: rf.commitIndex,
+>PrevLogIndex: rf.nextIndex[server] - 1,
+>PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
+>Entries:      append([]LogEntry{}, rf.log[rf.nextIndex[server]:]...),
+>}
+>reply := AppendEntriesReply{}
+>go rf.sendAppendEntries(server, &args, &reply)
+> ```
+
 The heartbeat interval is 150ms, shorter than the election timeout.
 
 The optimized lock boundary in my heartbeat loop is:
@@ -476,13 +468,10 @@ if rf.state == Leader && rf.currentTerm == leaderTerm {
 		"leader_id", rf.me,
 	)
 	rf.mu.Unlock()
-	shutDown := make(chan int, len(rf.peers))
+}
 ```
 
 The mutex is released before network calls and timer waits.
-
-> [!note] Future refinement
-> Later implementations should copy all RPC fields into local variables while holding `rf.mu`, then send an immutable snapshot after unlocking.
 
 ---
 
@@ -542,19 +531,27 @@ if reply.Term > rf.currentTerm {
 	)
 	rf.state = Follower
 	rf.currentTerm = reply.Term
-	shutDown <- reply.Term
 }
 ```
 
 The heartbeat loop exits:
 
 ```go
-case <-shutDown:
-	slog.Debug("heartbeat loop received a newer-term notification; switching back to ticker",
-		"peer_id", rf.me,
-	)
-	go rf.ticker()
-	return
+for {
+	rf.mu.Lock()
+	if rf.state == Leader && rf.currentTerm == leaderTerm {
+		// send heartbeat
+		rf.mu.Unlock()
+	} else {
+		slog.Debug("heartbeat loop exiting; no longer leader or term changed",
+			"peer_id", rf.me,
+			"term", rf.currentTerm,
+		)
+		rf.mu.Unlock()
+		go rf.ticker()
+		return
+	}
+}
 ```
 
 The newer term invalidates the old leader's authority.
@@ -598,29 +595,7 @@ A receiver does not automatically own the right to close a channel. The long-liv
 
 ## 15. Bug Retrospective
 
-### Bug 1: Shared Vote Reply
-
-**Symptom:** the race detector reported concurrent access during vote RPCs.
-
-**Root cause:** multiple goroutines shared one `RequestVoteReply`.
-
-**Current fix:**
-
-```go
-args := RequestVoteArgs{
-	Term:         electionTerm,
-	CandidateId:  rf.me,
-	LastLogIndex: rf.lastLogIndex(),
-	LastLogTerm:  rf.lastLogTerm()}
-reply := RequestVoteReply{}
-go rf.sendRequestVote(server, electionTerm, votes, &args, &reply)
-```
-
-Each RPC owns its arguments and reply.
-
----
-
-### Bug 2: Heartbeat Handler Blocked
+### Bug 1: Heartbeat Handler Blocked
 
 **Symptom:** a peer logged the start of `AppendEntries()` and then stopped responding.
 
@@ -639,7 +614,9 @@ The RPC handler cannot block on the notification.
 
 ---
 
-### Bug 3: Old Heartbeat Goroutine Self-Deadlocked
+### Bug 2: Self-Deadlocked
+
+Here I just name a typical condition. Actually there were many conditions that may cause deadlock.
 
 **Symptom:** after stepping down, a peer disappeared from later logs and stopped answering RPCs.
 
@@ -663,7 +640,7 @@ Every lock path now has a matching unlock.
 
 ---
 
-### Bug 4: Old Election Won in a New Term
+### Bug 3: Old Election Won in a New Term
 
 **Symptom:**
 
@@ -689,19 +666,7 @@ Only the currently active election may promote the peer.
 
 ---
 
-### Bug 5: `break` Exited Only `select`
-
-**Root cause:** a plain `break` inside `select` did not reach the timer reset logic.
-
-**Current fix:**
-
-```go
-break Loop
-```
-
----
-
-### Bug 6: Heartbeat Wait Held `rf.mu`
+### Bug 4: Heartbeat Wait Held `rf.mu`
 
 **Symptom:** RPC handlers, replies, and `GetState()` waited unnecessarily for the heartbeat interval.
 
@@ -754,19 +719,22 @@ A concurrency bug may pass once because its scheduling order did not occur. Repe
 - simultaneous timeouts,
 - old-leader reconnection,
 - and rare lock/channel interleavings.
+### Final Result
 
-### Limits of the Evidence
+My final repeated run reported:
 
-The 1000-round result does not verify:
+```text
+Passed rounds: 1000
+Failed rounds: 0
 
-- unreliable RPC behavior,
-- persistence across crashes,
-- log replication safety,
-- snapshot recovery,
-- or production-scale performance.
+Average time by test case:
+  TestInitialElection3A                      4.406s  (1000 runs)
+  TestManyElections3A                        8.462s  (1000 runs)
+  TestReElection3A                           5.909s  (1000 runs)
+Average time sum of all test cases: 18.777s
+```
 
-Those require later labs and additional invariants.
-
+This is strong evidence for the tested 3A scenarios. It is not proof that the implementation already satisfies every rule needed by the complete Raft protocol.
 ---
 
 ## 17. Five-Minute Explanation
